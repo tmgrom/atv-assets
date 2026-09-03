@@ -1,0 +1,442 @@
+/* ------------------------------------------------------------------
+   kp-title-filter.js  v2
+
+   Фильтрация выдачи по словам, фразам и целым названиям
+   для клиента KinoPub (bundle.js для Micro IPTV / Apple TV).
+
+   Установка:
+     cat bundle.js kp-title-filter.js > bundle.new.js
+     mv bundle.new.js bundle.js
+
+   Список правил лежит в отдельном blocklist.json рядом с bundle.js
+   и подтягивается на лету — правится через git push, приложение
+   переустанавливать не нужно.
+   ------------------------------------------------------------------ */
+
+(function () {
+  "use strict";
+
+  /* ===== НАСТРОЙКИ ================================================= */
+
+  // Адрес blocklist.json. Пустая строка = взять из того же каталога,
+  // откуда загрузился сам bundle.js (globalThis.baseURL).
+  // Задан абсолютом намеренно: boot URL вводится через короткий редирект, и
+  // если оболочка возьмёт BASEURL от домена сокращателя, а не от конечного
+  // адреса, относительный путь уедет в никуда.
+  var LIST_URL = "https://tmgrom.github.io/atv-assets/blocklist.json";
+
+  // Запасной адрес, если baseURL по каким-то причинам недоступен.
+  var LIST_URL_FALLBACK =
+    "https://raw.githubusercontent.com/tmgrom/atv-assets/main/blocklist.json";
+
+  // Как часто перечитывать список, минут. 0 = только при старте.
+  var REFRESH_MIN = 15;
+
+  // true — скрывать и карточку фильма при заходе напрямую
+  // (история, TopShelf, продолжение просмотра)
+  var BLOCK_DETAIL = true;
+
+  // Правила «на всякий случай»: работают, даже если blocklist.json
+  // недоступен и в кэше пусто. Синтаксис тот же, что в файле.
+  var BUILTIN = [];
+
+  var LOG = false;
+
+  // ---- API-хост по умолчанию ----
+  // Micro IPTV не принимает boot URL с «#», а без хвоста #a=... приложение
+  // остаётся на хосте, зашитом в bundle.js. Подставляем значение сами —
+  // тогда ссылку можно вводить чистой: .../bundle.js
+  // Строка та же, что в оригинальном хвосте: XOR-hex ключом
+  // KINOPUB.clientSecret, декодируется в https://api.teleos.club
+  // Пустая строка = ничего не подставлять.
+  var DEFAULT_A = "5b0e4141410e4445541c005f0d5c0b04071d44115c4213";
+
+  // true — подставлять, даже если в ссылке уже есть свой a= или u=
+  var FORCE_DEFAULT_A = false;
+
+  // ---- индикатор в интерфейсе ----
+  // Дописывает к шестерёнке настроек в верхнем меню счётчик вида "⚙ 12·37":
+  //   12 — сколько правил блокировки сейчас загружено
+  //   37 — сколько записей вырезано с момента запуска приложения
+  var BADGE = true;
+  var BADGE_ICON = "\u2699";        // символ шестерёнки, как в оригинале
+  var BADGE_SHOW_REMOVED = true;    // false — показывать только число правил
+  var BADGE_SEP = "\u00B7";         // разделитель между числами
+
+  /* ===== НОРМАЛИЗАЦИЯ И СОПОСТАВЛЕНИЕ ============================== */
+
+  // Класс «буква»: цифры, латиница, кириллица (вкл. укр./бел.), _
+  var L = "0-9A-Za-z\\u0400-\\u04FF\\u0500-\\u052F_";
+
+  function norm(s) {
+    return String(s == null ? "" : s)
+      .toLowerCase()
+      .replace(/\u0451/g, "\u0435")   // ё -> е (реально пишут и так, и так)
+      .replace(/[\u2010-\u2015\u2212]/g, "-")
+      .replace(/[\u00AB\u00BB\u201C\u201D\u201E\u2018\u2019]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/^\s+|\s+$/g, "");
+  }
+
+  function esc(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // Границы слова через группы, а не через \b и не через lookbehind:
+  // \b в JS работает только по ASCII, а (?<=) появился лишь в свежих
+  // версиях JavaScriptCore и на старых Apple TV упадёт.
+  function phraseRe(p) {
+    var body = esc(p).replace(/\s+/g, "\\s+");
+    return new RegExp("(^|[^" + L + "])" + body + "([^" + L + "]|$)");
+  }
+
+  // Компиляция одного правила в функцию-предикат
+  function compile(raw) {
+    var s = String(raw == null ? "" : raw);
+    var trimmed = s.replace(/^\s+|\s+$/g, "");
+    if (!trimmed || trimmed.charAt(0) === "#") return null; // пустое / коммент
+
+    // re:  — сырое регулярное выражение
+    if (/^re:/i.test(trimmed)) {
+      try {
+        var re = new RegExp(trimmed.slice(3).replace(/^\s+/, ""), "i");
+        return function (t, parts) { return re.test(t); };
+      } catch (e) {
+        if (LOG) console.log("[filter] битая регулярка: " + trimmed);
+        return null;
+      }
+    }
+
+    // =  — точное совпадение с названием целиком
+    if (trimmed.charAt(0) === "=") {
+      var want = norm(trimmed.slice(1));
+      if (!want) return null;
+      return function (t, parts) {
+        if (t === want) return true;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i] === want) return true;
+        }
+        return false;
+      };
+    }
+
+    // иначе — слово или фраза по границам слов
+    var n = norm(trimmed);
+    if (!n) return null;
+    var pre = phraseRe(n);
+    return function (t, parts) { return pre.test(t); };
+  }
+
+  function compileAll(arr) {
+    var out = [];
+    if (Object.prototype.toString.call(arr) !== "[object Array]") return out;
+    for (var i = 0; i < arr.length; i++) {
+      var f = compile(arr[i]);
+      if (f) out.push(f);
+    }
+    return out;
+  }
+
+  /* ===== СОСТОЯНИЕ ================================================= */
+
+  var RULES = { block: compileAll(BUILTIN), allow: [] };
+  var CACHE_KEY = "kpTitleFilterList";
+  var removedTotal = 0;
+
+  /* ===== ИНДИКАТОР В МЕНЮ ========================================== */
+
+  var lastBadge = null;
+
+  function badgeText() {
+    var s = BADGE_ICON + " " + RULES.block.length;
+    if (BADGE_SHOW_REMOVED) s += BADGE_SEP + removedTotal;
+    return s;
+  }
+
+  // Обновляет уже отрисованную шестерёнку во всех открытых документах.
+  // Меню строится один раз при старте, поэтому дорисовывать приходится
+  // по живому DOM, а не только через шаблон.
+  function refreshBadge() {
+    if (!BADGE) return;
+    var text = badgeText();
+    if (text === lastBadge) return;
+
+    try {
+      var docs = navigationDocument.documents;
+      var touched = false;
+      for (var i = 0; i < docs.length; i++) {
+        var el = docs[i].getElementById("Settings");
+        if (!el) continue;
+        var t = el.getElementsByTagName("title").item(0);
+        if (t) { t.textContent = text; touched = true; }
+      }
+      if (touched) lastBadge = text;
+    } catch (e) { /* меню ещё не отрисовано — не страшно */ }
+  }
+
+  // Подмена в самом шаблоне, чтобы при первой отрисовке
+  // счётчик уже стоял на месте и не мигал.
+  function patchTemplates() {
+    if (typeof Templates === "undefined" || !Templates) return false;
+    if (Templates.__titleFilterBadge) return true;
+
+    var names = ["menuBar", "menuBarChild"];
+    for (var i = 0; i < names.length; i++) {
+      (function (name) {
+        var orig = Templates[name];
+        if (typeof orig !== "function") return;
+        Templates[name] = function () {
+          var doc = orig.apply(Templates, arguments);
+          if (!BADGE || typeof doc !== "string") return doc;
+          lastBadge = badgeText();
+          return doc.replace(
+            /(<menuItem\s+id\s*=\s*"Settings"\s*>\s*<title>)[^<]*(<\/title>)/,
+            "$1" + badgeText() + "$2"
+          );
+        };
+      })(names[i]);
+    }
+
+    Templates.__titleFilterBadge = true;
+    return true;
+  }
+
+  function applyList(obj) {
+    // Принимаем и голый массив, и объект { block: [...], allow: [...] }
+    var block, allow;
+    if (Object.prototype.toString.call(obj) === "[object Array]") {
+      block = obj; allow = [];
+    } else if (obj && typeof obj === "object") {
+      block = obj.block || obj.blocklist || [];
+      allow = obj.allow || obj.allowlist || [];
+    } else {
+      return false;
+    }
+    RULES = { block: compileAll(block), allow: compileAll(allow) };
+    if (LOG) {
+      console.log("[filter] правил: блок " + RULES.block.length +
+                  ", исключений " + RULES.allow.length);
+    }
+    refreshBadge();
+    return true;
+  }
+
+  function matches(list, title, parts) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i](title, parts)) return true;
+    }
+    return false;
+  }
+
+  // В API название приходит одной строкой "Русское / Original",
+  // проверяем и целиком, и каждую часть по отдельности.
+  function isBlocked(item) {
+    if (!item) return false;
+    var t = norm(item.title);
+    var sub = norm(item.subtitle);
+    var full = sub ? (t + " / " + sub) : t;
+
+    var parts = [];
+    var chunks = full.split(" / ");
+    for (var i = 0; i < chunks.length; i++) {
+      var c = chunks[i].replace(/^\s+|\s+$/g, "");
+      if (c) parts.push(c);
+    }
+
+    if (matches(RULES.allow, full, parts)) return false;
+    return matches(RULES.block, full, parts);
+  }
+
+  /* ===== ЗАГРУЗКА СПИСКА =========================================== */
+
+  function readCache() {
+    try {
+      var raw = localStorage.getItem(CACHE_KEY);
+      if (raw) applyList(JSON.parse(raw));
+    } catch (e) { /* пусто или битый кэш — не страшно */ }
+  }
+
+  function writeCache(text) {
+    try { localStorage.setItem(CACHE_KEY, text); } catch (e) {}
+  }
+
+  function listUrl() {
+    var base = LIST_URL;
+    if (!base) {
+      try {
+        if (typeof baseURL === "string" && baseURL) {
+          base = baseURL.replace(/[^\/]*$/, "") + "blocklist.json";
+        }
+      } catch (e) {}
+    }
+    if (!base) base = LIST_URL_FALLBACK;
+    // Обход кэша CDN у GitHub
+    return base + (base.indexOf("?") === -1 ? "?" : "&") + "t=" + Date.now();
+  }
+
+  function fetchList() {
+    var url = listUrl();
+    try {
+      var x = new XMLHttpRequest();
+      x.open("GET", url, true);
+      x.timeout = 8000;
+      x.onload = function () {
+        if (x.status < 200 || x.status >= 300) return;
+        var parsed;
+        try { parsed = JSON.parse(x.responseText); }
+        catch (e) { if (LOG) console.log("[filter] blocklist.json не парсится"); return; }
+        if (applyList(parsed)) writeCache(x.responseText);
+      };
+      x.onerror = function () { if (LOG) console.log("[filter] список недоступен"); };
+      x.send();
+    } catch (e) {}
+  }
+
+  /* ===== ФИЛЬТРАЦИЯ ОТВЕТОВ ======================================== */
+
+  function scrub(text) {
+    if (!RULES.block.length) return text;
+
+    var data;
+    try { data = JSON.parse(text); } catch (e) { return text; }
+    if (!data || typeof data !== "object") return text;
+
+    // Списки: /items, /items/search, /watching, коллекции, похожие
+    if (Object.prototype.toString.call(data.items) === "[object Array]") {
+      var before = data.items.length;
+      var kept = [];
+      for (var i = 0; i < data.items.length; i++) {
+        if (!isBlocked(data.items[i])) kept.push(data.items[i]);
+      }
+      data.items = kept;
+
+      var removed = before - kept.length;
+      if (removed > 0) {
+        if (data.pagination && typeof data.pagination.total === "number") {
+          data.pagination.total = Math.max(0, data.pagination.total - removed);
+        }
+        removedTotal += removed;
+        refreshBadge();
+        if (LOG) console.log("[filter] вырезано: " + removed);
+      }
+      return JSON.stringify(data);
+    }
+
+    // Карточка одного фильма: /items/{id}
+    if (BLOCK_DETAIL && data.item && isBlocked(data.item)) {
+      if (LOG) console.log("[filter] карточка заблокирована");
+      return JSON.stringify({ status: 404, message: "Not found" });
+    }
+
+    return text;
+  }
+
+  /* ===== ПЕРЕХВАТ Ajax ============================================= */
+
+  function wrap(obj, name) {
+    var orig = obj[name];
+    if (typeof orig !== "function") return;
+
+    obj[name] = function () {
+      var args = Array.prototype.slice.call(arguments);
+      var cb = args[3]; // колбэк — 4-й аргумент во всех методах Ajax
+
+      if (typeof cb === "function") {
+        args[3] = function (xhr) {
+          // responseText у XHR только для чтения, поэтому подменяем
+          // объект целиком заглушкой с теми же полями
+          return cb({
+            status: xhr.status,
+            readyState: xhr.readyState,
+            responseText: scrub(xhr.responseText)
+          });
+        };
+      }
+      return orig.apply(obj, args);
+    };
+  }
+
+  function install() {
+    if (typeof Ajax === "undefined" || !Ajax) return false;
+    if (Ajax.__titleFilter) return true;
+
+    // aget/apost внутри вызывают get/post — их не трогаем,
+    // иначе фильтр отработает дважды.
+    wrap(Ajax, "get");
+    wrap(Ajax, "post");
+    wrap(Ajax, "apostInUrl");
+
+    Ajax.__titleFilter = true;
+
+    // Ручное обновление из консоли отладчика: Ajax.reloadTitleFilter()
+    Ajax.reloadTitleFilter = function () { fetchList(); refreshBadge(); };
+
+    if (LOG) console.log("[filter] перехват установлен");
+    return true;
+  }
+
+  /* ===== BOOT: API-ХОСТ И ПЕРВАЯ ЗАГРУЗКА СПИСКА =================== */
+
+  // hashConfig и baseURL — настоящие глобальные переменные bundle.js
+  // (globalThis.hashConfig / globalThis.baseURL), заполняет их App.onLaunch.
+  // Оборачиваем onLaunch и дописываем недостающее ПОСЛЕ разбора ссылки, но
+  // ДО AppSettings.populate(hashConfig): populate вызывается из onLaunch
+  // через setTimeout на секунду, так что успеваем.
+  // Тот же объект hashConfig потом читает AppSettings.setDefaultUrl(), так
+  // что и сохранённый boot URL получится с правильным хвостом.
+  function applyDefaultApiHost() {
+    if (!DEFAULT_A) return;
+    var cfg = globalThis.hashConfig;
+    if (!cfg || typeof cfg !== "object") return;
+    if (!FORCE_DEFAULT_A && (cfg.a || cfg.u)) return;
+    cfg.a = DEFAULT_A;
+    if (LOG) console.log("[filter] подставлен API-хост по умолчанию");
+  }
+
+  function patchBoot() {
+    if (typeof App === "undefined" || !App) return false;
+    if (App.__titleFilterBoot) return true;
+    var orig = App.onLaunch;
+    if (typeof orig !== "function") return false;
+
+    App.onLaunch = function () {
+      try {
+        return orig.apply(App, arguments);
+      } finally {
+        try { applyDefaultApiHost(); } catch (e) {}
+        // baseURL известен только начиная с onLaunch, поэтому первый запрос
+        // списка делаем отсюда, а не при загрузке файла
+        try { fetchList(); } catch (e) {}
+      }
+    };
+
+    App.__titleFilterBoot = true;
+    return true;
+  }
+
+  /* ===== СТАРТ ===================================================== */
+
+  readCache();   // мгновенно — правила с прошлого запуска
+
+  // API-хост по умолчанию + первая загрузка списка. Если обернуть onLaunch
+  // не вышло (её уже вызвали или её нет) — тянем список сразу.
+  if (!patchBoot()) fetchList();
+
+  if (REFRESH_MIN > 0) {
+    setInterval(fetchList, REFRESH_MIN * 60 * 1000);
+  }
+
+  // Ajax и Templates появляются в globalThis только внутри onLaunch,
+  // поэтому ждём их до 30 секунд, а не 5.
+  if (!install() || !patchTemplates()) {
+    var tries = 0;
+    var timer = setInterval(function () {
+      var done = install() && patchTemplates();
+      if (done || ++tries > 300) clearInterval(timer);
+    }, 100);
+  }
+
+  // Меню могло отрисоваться раньше, чем доехал список — подстрахуемся
+  setTimeout(refreshBadge, 3000);
+  setTimeout(refreshBadge, 10000);
+})();
