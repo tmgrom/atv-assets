@@ -837,6 +837,17 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // Дописывает к шестерёнке настроек в верхнем меню счётчик вида "⚙ 12·37":
   //   12 — сколько правил блокировки сейчас загружено
   //   37 — сколько записей вырезано с момента запуска приложения
+  // ---- таймауты запросов ----
+  // В оригинале Ajax ставит XHR timeout = 10 с и НЕ определяет ontimeout:
+  // при таймауте не вызывается ни onload, ни onerror, колбэк не приходит —
+  // и раздел крутит загрузку вечно. Поднимаем лимит и повторяем запрос.
+  var AJAX_TIMEOUT = 30000;     // мс; 0 — не трогать чужой таймаут
+  var AJAX_RETRIES = 1;         // сколько раз повторить после таймаута
+
+  // Чем ответить, когда и повтор не дожил: пустой список лучше вечного
+  // спиннера — раздел отрисуется пустым, а не подвиснет.
+  var EMPTY_LIST = '{"items":[],"pagination":{"total":0,"current":1,"perpage":0,"total_pages":0}}';
+
   // ---- диагностика ----
   // Показывает поверх интерфейса экран «Диагностика»: какой API-хост подставлен,
   // какие запросы ушли и чем кончились, и какие хосты вообще отвечают
@@ -844,7 +855,7 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // Включается без пересборки: поле "debug": true в blocklist.json
   // (значение кэшируется, так что со второго запуска работает и оффлайн).
   var DEBUG_FORCE = false;      // true — показывать всегда, мимо blocklist.json
-  var DEBUG_DELAY = 15000;      // через сколько мс после старта показать
+  var DEBUG_DELAY = 22000;      // через сколько мс после старта показать
   var NET_MAX = 40;             // сколько последних запросов помнить
 
   // Хосты для проверки связи с устройства. mode нужен только чтобы собрать
@@ -951,6 +962,8 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   var NET = [];               // кольцевой буфер запросов для диагностики
   var PROBE = [];             // результаты проверки хостов
   var scrubErrors = 0;        // сбои фильтрации (не должны случаться)
+  var netTimeouts = 0;        // сколько запросов упёрлись в таймаут
+  var netRetries = 0;         // сколько раз пришлось повторить
   var bootHost = "";          // что в итоге подставили в hashConfig
   var removedTotal = 0;
 
@@ -1176,6 +1189,34 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     var orig = obj[name];
     if (typeof orig !== "function") return;
 
+    // Запуск с обработкой таймаута: повтор, а на последней попытке —
+    // синтетический пустой ответ, чтобы колбэк всё-таки был вызван.
+    function fire(args, attempt) {
+      var xhr = orig.apply(obj, args);
+      try {
+        if (!xhr || typeof xhr !== "object") return xhr;
+        if (AJAX_TIMEOUT) {
+          // у синхронных запросов timeout менять нельзя — отсюда try
+          try { xhr.timeout = AJAX_TIMEOUT; } catch (e) {}
+        }
+        xhr.ontimeout = function () {
+          netTimeouts++;
+          if (attempt < AJAX_RETRIES) {
+            netRetries++;
+            try { fire(args, attempt + 1); } catch (e) {}
+            return;
+          }
+          var cb = args[3];
+          if (typeof cb === "function") {
+            try {
+              cb({ status: 0, readyState: 4, responseText: EMPTY_LIST });
+            } catch (e) {}
+          }
+        };
+      } catch (e) {}
+      return xhr;
+    }
+
     obj[name] = function () {
       var args = Array.prototype.slice.call(arguments);
       var cb = args[3]; // колбэк — 4-й аргумент во всех методах Ajax
@@ -1198,7 +1239,7 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
           });
         };
       }
-      return orig.apply(obj, args);
+      return fire(args, 0);
     };
   }
 
@@ -1321,7 +1362,16 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
       P.open = function (method, url) {
         try { this.__fm = { m: String(method || "?"), u: String(url || ""), t0: 0, st: "—", code: 0 }; }
         catch (e) {}
-        return open.apply(this, arguments);
+        var r = open.apply(this, arguments);
+        // Оригинал ставит timeout до open() — значит здесь его уже видно и
+        // ещё можно поднять. Нулевой не трогаем: там таймаута и не хотели.
+        // У синхронных запросов присвоение бросает исключение — отсюда try.
+        try {
+          if (AJAX_TIMEOUT && this.timeout && this.timeout < AJAX_TIMEOUT) {
+            this.timeout = AJAX_TIMEOUT;
+          }
+        } catch (e) {}
+        return r;
       };
 
       P.send = function () {
@@ -1356,30 +1406,49 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     } catch (e) {}
   }
 
-  // Достучаться до хоста с самого устройства. Без токена API отвечает 401 —
-  // этого достаточно: значит хост жив и маршрут до него есть.
+  // Достучаться до хоста с самого устройства — ровно так, как это делает
+  // приложение: с его токеном и его заголовками. Синтетический запрос без
+  // токена часть прокси просто рвёт, поэтому первая версия проверки врала
+  // «ошибка сети» там, где настоящие запросы проходили.
+  // Меряем два конца: лёгкий /types и тяжёлый /items (каталог, perpage=47) —
+  // именно тяжёлый и упирается в таймаут.
+  function apiToken() {
+    try {
+      var t = localStorage.getItem("accessToken");
+      return t ? String(t).replace(/^"+|"+$/g, "") : "";
+    } catch (e) { return ""; }
+  }
+
+  function probeOne(rec, field, url) {
+    var t0 = Date.now();
+    rec[field] = "идёт…";
+    try {
+      var x = new XMLHttpRequest();
+      x.open("GET", url, true);
+      x.__fmSkip = true;          // не засорять список запросов проверками
+      x.timeout = 15000;
+      try { x.setRequestHeader("Content-Type", "application/json"); } catch (e) {}
+      x.onload = function () {
+        var ms = Date.now() - t0;
+        rec[field] = (x.status === 200 ? "" : "HTTP " + x.status + " ") + ms + "мс";
+      };
+      x.onerror   = function () { rec[field] = "ошибка (" + (Date.now() - t0) + "мс)"; };
+      x.ontimeout = function () { rec[field] = "таймаут"; };
+      x.send();
+    } catch (e) { rec[field] = "исключение"; }
+  }
+
   function probeHosts() {
+    var tok = apiToken();
+    PROBE = [];
     for (var i = 0; i < PROBE_HOSTS.length; i++) {
-      (function (h) {
-        var rec = { host: h.host.replace(/^https?:\/\//, ""), st: "нет ответа", ms: 0 };
-        PROBE.push(rec);
-        var t0 = Date.now();
-        try {
-          var url = h.host + (h.mode === "a" ? "/v1/types" : "/api/v1/types") +
-                    "?access_token=probe&t=" + t0;
-          var x = new XMLHttpRequest();
-          x.open("GET", url, true);
-          x.__fmSkip = true;          // не засорять список запросов проверками
-          x.timeout = 7000;
-          x.onload = function () {
-            rec.ms = Date.now() - t0;
-            rec.st = x.status === 401 ? "жив (401)" : "HTTP " + x.status;
-          };
-          x.onerror   = function () { rec.ms = Date.now() - t0; rec.st = "ошибка сети"; };
-          x.ontimeout = function () { rec.ms = Date.now() - t0; rec.st = "таймаут"; };
-          x.send();
-        } catch (e) { rec.st = "исключение"; }
-      })(PROBE_HOSTS[i]);
+      var h = PROBE_HOSTS[i];
+      var base = h.host + (h.mode === "a" ? "/v1/" : "/api/v1/");
+      var rec = { host: h.host.replace(/^https?:\/\//, ""), light: "—", heavy: "—" };
+      PROBE.push(rec);
+      var tail = "access_token=" + tok + "&rand=" + Date.now();
+      probeOne(rec, "light", base + "types?" + tail);
+      probeOne(rec, "heavy", base + "items?type=movie&page=1&perpage=47&" + tail);
     }
   }
 
@@ -1396,13 +1465,15 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     try { L.push("apiBase:  " + KINOPUB.apiBase); } catch (e) {}
     L.push("Правил: " + RULES.block.length + " · вырезано: " + removedTotal +
            (scrubErrors ? " · сбоев фильтра: " + scrubErrors : ""));
+    L.push("Таймаутов: " + netTimeouts + " · повторов: " + netRetries +
+           " · токен: " + (apiToken() ? "есть" : "НЕТ"));
     L.push("");
 
-    L.push("Хосты с этого устройства:");
+    L.push("Хосты (лёгкий /types · каталог /items):");
     if (!PROBE.length) L.push("  проверка не запускалась");
     for (var i = 0; i < PROBE.length; i++) {
-      L.push("  " + PROBE[i].host + " — " + PROBE[i].st +
-             (PROBE[i].ms ? " (" + PROBE[i].ms + " мс)" : ""));
+      L.push("  " + PROBE[i].host);
+      L.push("     " + PROBE[i].light + " · " + PROBE[i].heavy);
     }
     L.push("");
 
@@ -1441,7 +1512,7 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   function startDiagnostics() {
     watchNetwork();
     setTimeout(function () { if (DEBUG) { try { probeHosts(); } catch (e) {} } },
-               Math.max(1000, DEBUG_DELAY - 9000));
+               Math.max(1000, DEBUG_DELAY - 16000));
     setTimeout(function () { if (DEBUG) showReport(); }, DEBUG_DELAY);
     // Второй снимок: к этому моменту видно, какие запросы так и не ответили
     setTimeout(function () {
