@@ -846,8 +846,13 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // В оригинале Ajax ставит XHR timeout = 10 с и НЕ определяет ontimeout:
   // при таймауте не вызывается ни onload, ни onerror, колбэк не приходит —
   // и раздел крутит загрузку вечно. Поднимаем лимит и повторяем запрос.
-  var AJAX_TIMEOUT = 30000;     // мс; 0 — не трогать чужой таймаут
-  var AJAX_RETRIES = 1;         // сколько раз повторить после таймаута
+  // Замер с устройства: успешный ответ каталога — 0.5 с, а зависший не
+  // оживает и за 30 с. Ждать долго бессмысленно и вредно: подвисший запрос
+  // занимает соединение, и за ним выстраивается очередь из остальных
+  // (в логе это видно как пачка «ok 30.5 с» сразу после таймаута).
+  // Поэтому: падать быстро и повторять.
+  var AJAX_TIMEOUT = 12000;     // мс; 0 — не трогать чужой таймаут
+  var AJAX_RETRIES = 2;         // сколько раз повторить после таймаута
 
   // Чем ответить, когда и повтор не дожил: пустой список лучше вечного
   // спиннера — раздел отрисуется пустым, а не подвиснет.
@@ -1471,8 +1476,17 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     } catch (e) { rec[field] = { st: "исключение", ms: 0, ok: false }; }
   }
 
+  function userName() {
+    try {
+      if (globalThis.UserInfo && UserInfo.username) {
+        return "&meta_username=" + UserInfo.username;
+      }
+    } catch (e) {}
+    return "";
+  }
+
   function probeHosts() {
-    var tok = apiToken();
+    var tok = apiToken(), user = userName();
     PROBE = [];
     for (var i = 0; i < PROBE_HOSTS.length; i++) {
       var h = PROBE_HOSTS[i];
@@ -1484,9 +1498,14 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
         heavy: { st: "—", ms: 0, ok: false }
       };
       PROBE.push(rec);
-      var tail = "access_token=" + tok + "&rand=" + Date.now();
+      // Хвост собираем как Ajax.aget: access_token + meta_username.
+      // Без meta_username часть прокси держит запрос до таймаута — из-за
+      // этого прошлая проба показывала «таймаут» там, где настоящие
+      // запросы приложения проходили за полсекунды.
+      var tail = "access_token=" + tok + user + "&rand=" + Date.now();
       probeOne(rec, "light", base + "types?" + tail);
-      probeOne(rec, "heavy", base + "items?type=movie&page=1&perpage=47&" + tail);
+      probeOne(rec, "heavy",
+               base + "items?sort=-created&page=0&perpage=47&type=movie&" + tail);
     }
   }
 
@@ -1514,6 +1533,22 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     autoNote = "следующий запуск — " + best.host + " (" + best.heavy.ms + "мс)";
   }
 
+  // Статистика по настоящим запросам каталога — честнее любой пробы
+  function catalogStats() {
+    var r = { ok: 0, to: 0, hang: 0, min: 0, max: 0 };
+    for (var i = 0; i < NET.length; i++) {
+      var x = NET[i];
+      if (String(x.u).indexOf("items") === -1) continue;
+      if (x.st === "ok") {
+        r.ok++;
+        if (!r.min || x.ms < r.min) r.min = x.ms;
+        if (x.ms > r.max) r.max = x.ms;
+      } else if (x.st === "таймаут") r.to++;
+      else if (x.st === "идёт" && Date.now() - x.t0 > 8000) r.hang++;
+    }
+    return r;
+  }
+
   function shortUrl(u) {
     var v = String(u).replace(/^https?:\/\//, "");
     v = v.replace(/access_token=[^&]*/, "token=…");
@@ -1530,6 +1565,10 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     L.push("Таймаутов: " + netTimeouts + " · повторов: " + netRetries +
            " · токен: " + (apiToken() ? "есть" : "НЕТ"));
     L.push("Автовыбор: " + autoNote);
+    var cs = catalogStats();
+    L.push("Каталог живьём: ok " + cs.ok +
+           (cs.ok ? " (" + cs.min + "–" + cs.max + "мс)" : "") +
+           " · таймаутов " + cs.to + " · висит " + cs.hang);
     L.push("");
 
     L.push("Хосты (лёгкий /types · каталог /items):");
