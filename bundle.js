@@ -816,13 +816,18 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // Пустая строка = ничего не подставлять.
   //
   // Хосты автора (проверять, если каталог перестал грузиться):
-  //   https://ro03.flexcdn.cloud  — "u", urlr.me/!atv4kp (актуальный)
   //   https://api.teleos.club     — "a", git.new/atv4kptos, atv4.dnskp.cc
-  var DEFAULT_HOST = "https://ro03.flexcdn.cloud";
-  var DEFAULT_HOST_MODE = "u";
+  //   https://ro03.flexcdn.cloud  — "u", urlr.me/!atv4kp
+  // Замер с устройства 17.09.2026: teleos отдаёт каталог за 0.7 с,
+  // flexcdn — таймаут, proxykp не отвечает вовсе.
+  var DEFAULT_HOST = "https://api.teleos.club";
+  var DEFAULT_HOST_MODE = "a";
 
-  // true — подставлять, даже если в ссылке уже есть свой a= или u=
-  var FORCE_DEFAULT_HOST = false;
+  // true — подставлять, даже если в ссылке уже есть свой a= или u=.
+  // Включено намеренно: оболочка запоминает boot URL вместе со старым хвостом
+  // (AppSettings.setDefaultUrl), и без принудительной подстановки обновление
+  // сборки не меняло бы хост при автозапуске.
+  var FORCE_DEFAULT_HOST = true;
 
   // Брошенные хосты. Если хвост ссылки (в том числе сохранённый boot URL
   // «открывать автоматически при запуске», куда AppSettings.setDefaultUrl
@@ -847,6 +852,14 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // Чем ответить, когда и повтор не дожил: пустой список лучше вечного
   // спиннера — раздел отрисуется пустым, а не подвиснет.
   var EMPTY_LIST = '{"items":[],"pagination":{"total":0,"current":1,"perpage":0,"total_pages":0}}';
+
+  // ---- автовыбор хоста ----
+  // Автор время от времени меняет прокси, и старый начинает отваливаться
+  // именно на каталоге (лёгкие запросы при этом идут). Раз в запуск меряем
+  // все известные хосты и, если текущий не отдаёт каталог, запоминаем
+  // лучший — он подставится со следующего запуска.
+  var AUTO_HOST = true;
+  var AUTO_MAX_MS = 8000;       // каталог считается живым, если быстрее этого
 
   // ---- диагностика ----
   // Показывает поверх интерфейса экран «Диагностика»: какой API-хост подставлен,
@@ -965,6 +978,7 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   var netTimeouts = 0;        // сколько запросов упёрлись в таймаут
   var netRetries = 0;         // сколько раз пришлось повторить
   var bootHost = "";          // что в итоге подставили в hashConfig
+  var autoNote = "не запускался";
   var removedTotal = 0;
 
   /* ===== ИНДИКАТОР В МЕНЮ ========================================== */
@@ -1421,7 +1435,7 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
 
   function probeOne(rec, field, url) {
     var t0 = Date.now();
-    rec[field] = "идёт…";
+    rec[field] = { st: "идёт…", ms: 0, ok: false };
     try {
       var x = new XMLHttpRequest();
       x.open("GET", url, true);
@@ -1430,12 +1444,18 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
       try { x.setRequestHeader("Content-Type", "application/json"); } catch (e) {}
       x.onload = function () {
         var ms = Date.now() - t0;
-        rec[field] = (x.status === 200 ? "" : "HTTP " + x.status + " ") + ms + "мс";
+        rec[field] = {
+          st: (x.status === 200 ? "" : "HTTP " + x.status + " ") + ms + "мс",
+          ms: ms,
+          ok: x.status === 200
+        };
       };
-      x.onerror   = function () { rec[field] = "ошибка (" + (Date.now() - t0) + "мс)"; };
-      x.ontimeout = function () { rec[field] = "таймаут"; };
+      x.onerror = function () {
+        rec[field] = { st: "ошибка (" + (Date.now() - t0) + "мс)", ms: 0, ok: false };
+      };
+      x.ontimeout = function () { rec[field] = { st: "таймаут", ms: 0, ok: false }; };
       x.send();
-    } catch (e) { rec[field] = "исключение"; }
+    } catch (e) { rec[field] = { st: "исключение", ms: 0, ok: false }; }
   }
 
   function probeHosts() {
@@ -1444,12 +1464,41 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     for (var i = 0; i < PROBE_HOSTS.length; i++) {
       var h = PROBE_HOSTS[i];
       var base = h.host + (h.mode === "a" ? "/v1/" : "/api/v1/");
-      var rec = { host: h.host.replace(/^https?:\/\//, ""), light: "—", heavy: "—" };
+      var rec = {
+        host: h.host.replace(/^https?:\/\//, ""),
+        url: h.host, mode: h.mode,
+        light: { st: "—", ms: 0, ok: false },
+        heavy: { st: "—", ms: 0, ok: false }
+      };
       PROBE.push(rec);
       var tail = "access_token=" + tok + "&rand=" + Date.now();
       probeOne(rec, "light", base + "types?" + tail);
       probeOne(rec, "heavy", base + "items?type=movie&page=1&perpage=47&" + tail);
     }
+  }
+
+  function currentHost() {
+    if (HOST_OVERRIDE && HOST_OVERRIDE.host) return HOST_OVERRIDE.host;
+    return DEFAULT_HOST;
+  }
+
+  function autoPick() {
+    if (!AUTO_HOST) { autoNote = "выключен"; return; }
+    var cur = currentHost(), curRec = null, best = null;
+    for (var i = 0; i < PROBE.length; i++) {
+      var r = PROBE[i];
+      if (r.url === cur) curRec = r;
+      if (r.heavy.ok && r.heavy.ms < AUTO_MAX_MS &&
+          (!best || r.heavy.ms < best.heavy.ms)) best = r;
+    }
+    if (curRec && curRec.heavy.ok && curRec.heavy.ms < AUTO_MAX_MS) {
+      autoNote = "текущий хост в порядке";
+      return;
+    }
+    if (!best) { autoNote = "живого хоста не нашлось"; return; }
+    if (best.url === cur) { autoNote = "текущий — лучший из доступных"; return; }
+    setHostOverride(best.url, best.mode);
+    autoNote = "следующий запуск — " + best.host + " (" + best.heavy.ms + "мс)";
   }
 
   function shortUrl(u) {
@@ -1467,13 +1516,14 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
            (scrubErrors ? " · сбоев фильтра: " + scrubErrors : ""));
     L.push("Таймаутов: " + netTimeouts + " · повторов: " + netRetries +
            " · токен: " + (apiToken() ? "есть" : "НЕТ"));
+    L.push("Автовыбор: " + autoNote);
     L.push("");
 
     L.push("Хосты (лёгкий /types · каталог /items):");
     if (!PROBE.length) L.push("  проверка не запускалась");
     for (var i = 0; i < PROBE.length; i++) {
       L.push("  " + PROBE[i].host);
-      L.push("     " + PROBE[i].light + " · " + PROBE[i].heavy);
+      L.push("     " + PROBE[i].light.st + " · " + PROBE[i].heavy.st);
     }
     L.push("");
 
@@ -1511,8 +1561,10 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
 
   function startDiagnostics() {
     watchNetwork();
-    setTimeout(function () { if (DEBUG) { try { probeHosts(); } catch (e) {} } },
+    // Замеры нужны и без диагностики — на них держится автовыбор хоста
+    setTimeout(function () { try { probeHosts(); } catch (e) {} },
                Math.max(1000, DEBUG_DELAY - 16000));
+    setTimeout(function () { try { autoPick(); } catch (e) {} }, DEBUG_DELAY - 1000);
     setTimeout(function () { if (DEBUG) showReport(); }, DEBUG_DELAY);
     // Второй снимок: к этому моменту видно, какие запросы так и не ответили
     setTimeout(function () {
