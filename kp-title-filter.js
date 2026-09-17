@@ -65,6 +65,15 @@
   // true — подставлять, даже если в ссылке уже есть свой a= или u=
   var FORCE_DEFAULT_HOST = false;
 
+  // Брошенные хосты. Если хвост ссылки (в том числе сохранённый boot URL
+  // «открывать автоматически при запуске», куда AppSettings.setDefaultUrl
+  // зашил старое значение) ведёт на такой хост — подменяем его на актуальный,
+  // не дожидаясь, пока пользователь перевведёт ссылку.
+  var STALE_HOSTS = [
+    "https://api.teleos.club",
+    "https://proxykp.xyz"
+  ];
+
   // ---- индикатор в интерфейсе ----
   // Дописывает к шестерёнке настроек в верхнем меню счётчик вида "⚙ 12·37":
   //   12 — сколько правил блокировки сейчас загружено
@@ -439,6 +448,24 @@
     return "3z5124kj5liqy9gahnjr07qpj65ferl2";   // дефолт из bundle.js
   }
 
+  function unHex(hex, key) {
+    var m = String(hex).match(/.{1,2}/g) || [];
+    var out = "";
+    for (var i = 0; i < m.length; i++) {
+      out += String.fromCharCode(parseInt(m[i], 16) ^ key.charCodeAt(i % key.length) % 255);
+    }
+    return out;
+  }
+
+  function isStale(hex, key) {
+    var host;
+    try { host = unHex(hex, key).replace(/\/+$/, ""); } catch (e) { return false; }
+    for (var i = 0; i < STALE_HOSTS.length; i++) {
+      if (STALE_HOSTS[i] === host) return true;
+    }
+    return false;
+  }
+
   function applyDefaultApiHost() {
     var host = DEFAULT_HOST, mode = DEFAULT_HOST_MODE;
     if (HOST_OVERRIDE && HOST_OVERRIDE.host) {
@@ -448,7 +475,9 @@
     if (!host) return;
     var cfg = globalThis.hashConfig;
     if (!cfg || typeof cfg !== "object") return;
-    if (!FORCE_DEFAULT_HOST && (cfg.a || cfg.u)) return;
+    var own = cfg.a || cfg.u;
+    if (own && !FORCE_DEFAULT_HOST && !isStale(own, secret())) return;
+    if (own && LOG) console.log("[filter] хост из ссылки заброшен, подменяю");
     var hex = xorHex(host, secret());
     if (mode === "a") { cfg.a = hex; delete cfg.u; }
     else { cfg.u = hex; delete cfg.a; }
