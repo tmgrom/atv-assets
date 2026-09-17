@@ -802,16 +802,27 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   var LOG = false;
 
   // ---- API-хост по умолчанию ----
-  // Micro IPTV не принимает boot URL с «#», а без хвоста #a=... приложение
-  // остаётся на хосте, зашитом в bundle.js. Подставляем значение сами —
-  // тогда ссылку можно вводить чистой: .../bundle.js
-  // Строка та же, что в оригинальном хвосте: XOR-hex ключом
-  // KINOPUB.clientSecret, декодируется в https://api.teleos.club
+  // Micro IPTV не принимает boot URL с «#», а без хвоста приложение остаётся
+  // на хосте, зашитом в bundle.js. Подставляем значение сами — тогда ссылку
+  // можно вводить чистой: .../bundle.js
+  //
+  // В оригинале хост приезжает хвостом «#u=<hex>» (так делают свежие
+  // редиректы) или «#a=<hex>» (старый способ). hex — это имя хоста,
+  // поксоренное ключом KINOPUB.clientSecret; кодируем сами из обычной
+  // строки, чтобы хост можно было менять руками.
+  //   "u" — хост-прокси целиком заменяет https://proxykp.xyz:
+  //         apiBase → <host>/api/v1/, cdn → <host>/cdn/
+  //   "a" — хост API: apiBase → <host>/v1/, cdn → <host, api.→m.>/
   // Пустая строка = ничего не подставлять.
-  var DEFAULT_A = "5b0e4141410e4445541c005f0d5c0b04071d44115c4213";
+  //
+  // Хосты автора (проверять, если каталог перестал грузиться):
+  //   https://ro03.flexcdn.cloud  — "u", urlr.me/!atv4kp (актуальный)
+  //   https://api.teleos.club     — "a", git.new/atv4kptos, atv4.dnskp.cc
+  var DEFAULT_HOST = "https://ro03.flexcdn.cloud";
+  var DEFAULT_HOST_MODE = "u";
 
   // true — подставлять, даже если в ссылке уже есть свой a= или u=
-  var FORCE_DEFAULT_A = false;
+  var FORCE_DEFAULT_HOST = false;
 
   // ---- индикатор в интерфейсе ----
   // Дописывает к шестерёнке настроек в верхнем меню счётчик вида "⚙ 12·37":
@@ -900,6 +911,13 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
 
   var RULES = { block: compileAll(BUILTIN), allow: [] };
   var CACHE_KEY = "kpTitleFilterList";
+  var HOST_KEY = "kpTitleFilterHost";
+
+  // Хост API из blocklist.json (поля apiHost / apiHostMode). Переопределяет
+  // DEFAULT_HOST и кэшируется, чтобы применяться уже при следующем запуске:
+  // populate() срабатывает через секунду после старта, ждать загрузки списка
+  // по сети некогда.
+  var HOST_OVERRIDE = null;   // { host: "https://...", mode: "u"|"a" }
   var removedTotal = 0;
 
   /* ===== ИНДИКАТОР В МЕНЮ ========================================== */
@@ -971,6 +989,9 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     } else {
       return false;
     }
+    if (obj && typeof obj === "object" && obj.apiHost) {
+      setHostOverride(obj.apiHost, obj.apiHostMode);
+    }
     RULES = { block: compileAll(block), allow: compileAll(allow) };
     if (LOG) {
       console.log("[filter] правил: блок " + RULES.block.length +
@@ -1010,9 +1031,25 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
 
   function readCache() {
     try {
+      var h = localStorage.getItem(HOST_KEY);
+      if (h) HOST_OVERRIDE = JSON.parse(h);
+    } catch (e) {}
+    try {
       var raw = localStorage.getItem(CACHE_KEY);
       if (raw) applyList(JSON.parse(raw));
     } catch (e) { /* пусто или битый кэш — не страшно */ }
+  }
+
+  // Хост из списка: запоминаем в localStorage, применится со следующего
+  // запуска (текущая сессия уже подняла API на прежнем хосте).
+  function setHostOverride(host, mode) {
+    host = String(host).replace(/\/+$/, "");
+    mode = (mode === "a" || mode === "u") ? mode : DEFAULT_HOST_MODE;
+    if (HOST_OVERRIDE && HOST_OVERRIDE.host === host &&
+        HOST_OVERRIDE.mode === mode) return;
+    HOST_OVERRIDE = { host: host, mode: mode };
+    try { localStorage.setItem(HOST_KEY, JSON.stringify(HOST_OVERRIDE)); } catch (e) {}
+    if (LOG) console.log("[filter] новый API-хост из списка: " + mode + " " + host);
   }
 
   function writeCache(text) {
@@ -1143,13 +1180,38 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   // через setTimeout на секунду, так что успеваем.
   // Тот же объект hashConfig потом читает AppSettings.setDefaultUrl(), так
   // что и сохранённый boot URL получится с правильным хвостом.
+  // Обратная операция к Utils.getByKey: строка -> XOR-hex тем же ключом.
+  // XOR симметричен, поэтому кодирование и декодирование — один и тот же код.
+  function xorHex(str, key) {
+    var out = "";
+    for (var i = 0; i < str.length; i++) {
+      var b = str.charCodeAt(i) ^ (key.charCodeAt(i % key.length) % 255);
+      out += (b < 16 ? "0" : "") + b.toString(16);
+    }
+    return out;
+  }
+
+  function secret() {
+    try {
+      if (globalThis.KINOPUB && KINOPUB.clientSecret) return KINOPUB.clientSecret;
+    } catch (e) {}
+    return "3z5124kj5liqy9gahnjr07qpj65ferl2";   // дефолт из bundle.js
+  }
+
   function applyDefaultApiHost() {
-    if (!DEFAULT_A) return;
+    var host = DEFAULT_HOST, mode = DEFAULT_HOST_MODE;
+    if (HOST_OVERRIDE && HOST_OVERRIDE.host) {
+      host = HOST_OVERRIDE.host;
+      mode = HOST_OVERRIDE.mode || DEFAULT_HOST_MODE;
+    }
+    if (!host) return;
     var cfg = globalThis.hashConfig;
     if (!cfg || typeof cfg !== "object") return;
-    if (!FORCE_DEFAULT_A && (cfg.a || cfg.u)) return;
-    cfg.a = DEFAULT_A;
-    if (LOG) console.log("[filter] подставлен API-хост по умолчанию");
+    if (!FORCE_DEFAULT_HOST && (cfg.a || cfg.u)) return;
+    var hex = xorHex(host, secret());
+    if (mode === "a") { cfg.a = hex; delete cfg.u; }
+    else { cfg.u = hex; delete cfg.a; }
+    if (LOG) console.log("[filter] API-хост по умолчанию: " + mode + "=" + host);
   }
 
   function patchBoot() {
