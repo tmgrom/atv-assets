@@ -78,6 +78,24 @@
   // Дописывает к шестерёнке настроек в верхнем меню счётчик вида "⚙ 12·37":
   //   12 — сколько правил блокировки сейчас загружено
   //   37 — сколько записей вырезано с момента запуска приложения
+  // ---- диагностика ----
+  // Показывает поверх интерфейса экран «Диагностика»: какой API-хост подставлен,
+  // какие запросы ушли и чем кончились, и какие хосты вообще отвечают
+  // с этого устройства. Закрывается кнопкой Menu на пульте.
+  // Включается без пересборки: поле "debug": true в blocklist.json
+  // (значение кэшируется, так что со второго запуска работает и оффлайн).
+  var DEBUG_FORCE = false;      // true — показывать всегда, мимо blocklist.json
+  var DEBUG_DELAY = 15000;      // через сколько мс после старта показать
+  var NET_MAX = 40;             // сколько последних запросов помнить
+
+  // Хосты для проверки связи с устройства. mode нужен только чтобы собрать
+  // правильный путь: "u" → <host>/api/v1/, "a" → <host>/v1/.
+  var PROBE_HOSTS = [
+    { host: "https://ro03.flexcdn.cloud", mode: "u" },
+    { host: "https://api.teleos.club",    mode: "a" },
+    { host: "https://proxykp.xyz",        mode: "u" }
+  ];
+
   var BADGE = true;
   var BADGE_ICON = "\u2699";        // символ шестерёнки, как в оригинале
   var BADGE_SHOW_REMOVED = true;    // false — показывать только число правил
@@ -162,12 +180,19 @@
   var RULES = { block: compileAll(BUILTIN), allow: [] };
   var CACHE_KEY = "kpTitleFilterList";
   var HOST_KEY = "kpTitleFilterHost";
+  var DEBUG_KEY = "kpTitleFilterDebug";
 
   // Хост API из blocklist.json (поля apiHost / apiHostMode). Переопределяет
   // DEFAULT_HOST и кэшируется, чтобы применяться уже при следующем запуске:
   // populate() срабатывает через секунду после старта, ждать загрузки списка
   // по сети некогда.
   var HOST_OVERRIDE = null;   // { host: "https://...", mode: "u"|"a" }
+
+  var DEBUG = DEBUG_FORCE;    // может включиться полем "debug" из списка
+  var NET = [];               // кольцевой буфер запросов для диагностики
+  var PROBE = [];             // результаты проверки хостов
+  var scrubErrors = 0;        // сбои фильтрации (не должны случаться)
+  var bootHost = "";          // что в итоге подставили в hashConfig
   var removedTotal = 0;
 
   /* ===== ИНДИКАТОР В МЕНЮ ========================================== */
@@ -239,8 +264,9 @@
     } else {
       return false;
     }
-    if (obj && typeof obj === "object" && obj.apiHost) {
-      setHostOverride(obj.apiHost, obj.apiHostMode);
+    if (obj && typeof obj === "object") {
+      if (obj.apiHost) setHostOverride(obj.apiHost, obj.apiHostMode);
+      if (typeof obj.debug === "boolean") setDebug(obj.debug);
     }
     RULES = { block: compileAll(block), allow: compileAll(allow) };
     if (LOG) {
@@ -285,9 +311,17 @@
       if (h) HOST_OVERRIDE = JSON.parse(h);
     } catch (e) {}
     try {
+      if (localStorage.getItem(DEBUG_KEY) === "1") DEBUG = true;
+    } catch (e) {}
+    try {
       var raw = localStorage.getItem(CACHE_KEY);
       if (raw) applyList(JSON.parse(raw));
     } catch (e) { /* пусто или битый кэш — не страшно */ }
+  }
+
+  function setDebug(on) {
+    DEBUG = on || DEBUG_FORCE;
+    try { localStorage.setItem(DEBUG_KEY, on ? "1" : "0"); } catch (e) {}
   }
 
   // Хост из списка: запоминаем в localStorage, применится со следующего
@@ -390,11 +424,18 @@
       if (typeof cb === "function") {
         args[3] = function (xhr) {
           // responseText у XHR только для чтения, поэтому подменяем
-          // объект целиком заглушкой с теми же полями
+          // объект целиком заглушкой с теми же полями.
+          // Любая ошибка внутри scrub не должна съесть колбэк: иначе
+          // исключение улетит в onload и раздел будет грузиться вечно.
+          var raw = "";
+          try { raw = xhr.responseText; } catch (e) {}
+          var text = raw;
+          try { text = scrub(raw); }
+          catch (e) { scrubErrors++; text = raw; }
           return cb({
             status: xhr.status,
             readyState: xhr.readyState,
-            responseText: scrub(xhr.responseText)
+            responseText: text
           });
         };
       }
@@ -416,6 +457,8 @@
 
     // Ручное обновление из консоли отладчика: Ajax.reloadTitleFilter()
     Ajax.reloadTitleFilter = function () { fetchList(); refreshBadge(); };
+    // Показать диагностику вручную: Ajax.showTitleFilterDebug()
+    Ajax.showTitleFilterDebug = function () { probeHosts(); setTimeout(showReport, 7000); };
 
     if (LOG) console.log("[filter] перехват установлен");
     return true;
@@ -481,6 +524,7 @@
     var hex = xorHex(host, secret());
     if (mode === "a") { cfg.a = hex; delete cfg.u; }
     else { cfg.u = hex; delete cfg.a; }
+    bootHost = mode + "=" + host;
     if (LOG) console.log("[filter] API-хост по умолчанию: " + mode + "=" + host);
   }
 
@@ -505,9 +549,154 @@
     return true;
   }
 
+  /* ===== ДИАГНОСТИКА =============================================== */
+
+  // Наблюдение за сетью на уровне XMLHttpRequest: ловим и то, что идёт мимо
+  // Ajax. Только фиксируем факты, ничего не меняем — обёртки насквозь.
+  function watchNetwork() {
+    try {
+      var P = XMLHttpRequest.prototype;
+      if (P.__titleFilterWatch) return;
+      var open = P.open, send = P.send;
+
+      P.open = function (method, url) {
+        try { this.__fm = { m: String(method || "?"), u: String(url || ""), t0: 0, st: "—", code: 0 }; }
+        catch (e) {}
+        return open.apply(this, arguments);
+      };
+
+      P.send = function () {
+        var self = this, rec = null;
+        try {
+          rec = self.__fm;
+          if (rec && !self.__fmSkip) {
+            rec.t0 = Date.now();
+            rec.st = "идёт";
+            NET.push(rec);
+            while (NET.length > NET_MAX) NET.shift();
+            var done = function (state) {
+              return function () {
+                if (rec.st !== "идёт") return;
+                rec.ms = Date.now() - rec.t0;
+                try { rec.code = self.status; } catch (e) {}
+                rec.st = state === "ok"
+                  ? (rec.code >= 200 && rec.code < 300 ? "ok" : "HTTP " + rec.code)
+                  : state;
+              };
+            };
+            self.addEventListener("load",    done("ok"));
+            self.addEventListener("error",   done("ошибка сети"));
+            self.addEventListener("timeout", done("таймаут"));
+            self.addEventListener("abort",   done("прервано"));
+          }
+        } catch (e) {}
+        return send.apply(this, arguments);
+      };
+
+      P.__titleFilterWatch = true;
+    } catch (e) {}
+  }
+
+  // Достучаться до хоста с самого устройства. Без токена API отвечает 401 —
+  // этого достаточно: значит хост жив и маршрут до него есть.
+  function probeHosts() {
+    for (var i = 0; i < PROBE_HOSTS.length; i++) {
+      (function (h) {
+        var rec = { host: h.host.replace(/^https?:\/\//, ""), st: "нет ответа", ms: 0 };
+        PROBE.push(rec);
+        var t0 = Date.now();
+        try {
+          var url = h.host + (h.mode === "a" ? "/v1/types" : "/api/v1/types") +
+                    "?access_token=probe&t=" + t0;
+          var x = new XMLHttpRequest();
+          x.open("GET", url, true);
+          x.__fmSkip = true;          // не засорять список запросов проверками
+          x.timeout = 7000;
+          x.onload = function () {
+            rec.ms = Date.now() - t0;
+            rec.st = x.status === 401 ? "жив (401)" : "HTTP " + x.status;
+          };
+          x.onerror   = function () { rec.ms = Date.now() - t0; rec.st = "ошибка сети"; };
+          x.ontimeout = function () { rec.ms = Date.now() - t0; rec.st = "таймаут"; };
+          x.send();
+        } catch (e) { rec.st = "исключение"; }
+      })(PROBE_HOSTS[i]);
+    }
+  }
+
+  function shortUrl(u) {
+    var v = String(u).replace(/^https?:\/\//, "");
+    v = v.replace(/access_token=[^&]*/, "token=…");
+    if (v.length > 52) v = v.slice(0, 26) + "…" + v.slice(-24);
+    return v;
+  }
+
+  function buildReport() {
+    var L = [];
+    L.push("API-хост: " + (bootHost || "из ссылки, не подставляли"));
+    try { L.push("apiBase:  " + KINOPUB.apiBase); } catch (e) {}
+    L.push("Правил: " + RULES.block.length + " · вырезано: " + removedTotal +
+           (scrubErrors ? " · сбоев фильтра: " + scrubErrors : ""));
+    L.push("");
+
+    L.push("Хосты с этого устройства:");
+    if (!PROBE.length) L.push("  проверка не запускалась");
+    for (var i = 0; i < PROBE.length; i++) {
+      L.push("  " + PROBE[i].host + " — " + PROBE[i].st +
+             (PROBE[i].ms ? " (" + PROBE[i].ms + " мс)" : ""));
+    }
+    L.push("");
+
+    L.push("Последние запросы:");
+    var n = 0;
+    for (var j = NET.length - 1; j >= 0 && n < 14; j--) {
+      var r = NET[j];
+      var st = r.st;
+      // «идёт» дольше 8 секунд — это и есть бесконечная загрузка
+      if (st === "идёт" && Date.now() - r.t0 > 8000) st = "висит";
+      L.push("  " + st + (r.ms ? " " + r.ms + "мс" : "") + " · " + shortUrl(r.u));
+      n++;
+    }
+    if (!n) L.push("  ни одного запроса не зафиксировано");
+    return L.join("\n");
+  }
+
+  function esc(t) {
+    return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function showReport() {
+    try {
+      if (typeof navigationDocument === "undefined") return;
+      var tvml =
+        '<?xml version="1.0" encoding="UTF-8" ?>' +
+        '<document><descriptiveAlertTemplate>' +
+        '<title>Диагностика фильтра</title>' +
+        '<description>' + esc(buildReport()) + '</description>' +
+        '</descriptiveAlertTemplate></document>';
+      var doc = new DOMParser().parseFromString(tvml, "application/xml");
+      navigationDocument.presentModal(doc);
+    } catch (e) {}
+  }
+
+  function startDiagnostics() {
+    watchNetwork();
+    setTimeout(function () { if (DEBUG) { try { probeHosts(); } catch (e) {} } },
+               Math.max(1000, DEBUG_DELAY - 9000));
+    setTimeout(function () { if (DEBUG) showReport(); }, DEBUG_DELAY);
+    // Второй снимок: к этому моменту видно, какие запросы так и не ответили
+    setTimeout(function () {
+      if (!DEBUG) return;
+      for (var i = 0; i < NET.length; i++) {
+        if (NET[i].st !== "ok") { showReport(); return; }
+      }
+    }, DEBUG_DELAY + 30000);
+  }
+
   /* ===== СТАРТ ===================================================== */
 
   readCache();   // мгновенно — правила с прошлого запуска
+  startDiagnostics();
 
   // API-хост по умолчанию + первая загрузка списка. Если обернуть onLaunch
   // не вышло (её уже вызвали или её нет) — тянем список сразу.

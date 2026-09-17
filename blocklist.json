@@ -3,6 +3,8 @@
   "# apiHostMode": "u — хост-прокси (apiBase → <host>/api/v1/), a — хост API (<host>/v1/)",
   "apiHost": "https://ro03.flexcdn.cloud",
   "apiHostMode": "u",
+  "# debug": "true — показывать экран диагностики через 15 с после старта",
+  "debug": true,
 
   "block": [
     "# --- слова и фразы: совпадение по границам слов ---",
