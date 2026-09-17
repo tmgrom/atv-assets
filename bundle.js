@@ -1094,7 +1094,14 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
   function readCache() {
     try {
       var h = localStorage.getItem(HOST_KEY);
-      if (h) HOST_OVERRIDE = JSON.parse(h);
+      if (h) {
+        var saved = JSON.parse(h);
+        // Кэш привязан к дефолту той сборки, при которой его записали.
+        // Сменился DEFAULT_HOST — значит сборка новее кэша и знает лучше:
+        // старое закрепление выбрасываем, иначе оно перебьёт новый хост.
+        if (saved && saved.base === DEFAULT_HOST) HOST_OVERRIDE = saved;
+        else localStorage.setItem(HOST_KEY, "");
+      }
     } catch (e) {}
     try {
       if (localStorage.getItem(DEBUG_KEY) === "1") DEBUG = true;
@@ -1117,7 +1124,13 @@ Device ID: `+Device.vendorIdentifier;c(W,null,"userInfo",2)}),API.getDeviceInfo(
     mode = (mode === "a" || mode === "u") ? mode : DEFAULT_HOST_MODE;
     if (HOST_OVERRIDE && HOST_OVERRIDE.host === host &&
         HOST_OVERRIDE.mode === mode) return;
-    HOST_OVERRIDE = { host: host, mode: mode };
+    if (host === DEFAULT_HOST && mode === DEFAULT_HOST_MODE) {
+      // возвращаться к дефолту через кэш незачем
+      HOST_OVERRIDE = null;
+      try { localStorage.setItem(HOST_KEY, ""); } catch (e) {}
+      return;
+    }
+    HOST_OVERRIDE = { host: host, mode: mode, base: DEFAULT_HOST };
     try { localStorage.setItem(HOST_KEY, JSON.stringify(HOST_OVERRIDE)); } catch (e) {}
     if (LOG) console.log("[filter] новый API-хост из списка: " + mode + " " + host);
   }
