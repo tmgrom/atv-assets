@@ -472,7 +472,9 @@
           // у синхронных запросов timeout менять нельзя — отсюда try
           try { xhr.timeout = AJAX_TIMEOUT; } catch (e) {}
         }
-        xhr.ontimeout = function () {
+        var onTimeout = function () {
+          if (xhr.__fmFired) return;      // не сработать дважды
+          xhr.__fmFired = true;
           netTimeouts++;
           if (attempt < AJAX_RETRIES) {
             netRetries++;
@@ -486,6 +488,11 @@
             } catch (e) {}
           }
         };
+        // Свойство .ontimeout на приставке не срабатывает (замер показал
+        // таймаут в логе при нулевом счётчике повторов), а слушатель — да.
+        // Вешаем оба: лишнего не случится, защита от двойного вызова внутри.
+        try { xhr.addEventListener("timeout", onTimeout); } catch (e) {}
+        try { xhr.ontimeout = onTimeout; } catch (e) {}
       } catch (e) {}
       return xhr;
     }
@@ -745,8 +752,10 @@
       // запросы приложения проходили за полсекунды.
       var tail = "access_token=" + tok + user + "&rand=" + Date.now();
       probeOne(rec, "light", base + "types?" + tail);
+      // loadItemsFrom шлёт ровно {page, perpage, type} — никаких sort,
+      // лишний параметр и подвешивал пробу там, где приложение получало ответ
       probeOne(rec, "heavy",
-               base + "items?sort=-created&page=0&perpage=47&type=movie&" + tail);
+               base + "items?page=0&perpage=47&type=movie&" + tail);
     }
   }
 
